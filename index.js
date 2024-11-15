@@ -1,107 +1,145 @@
-const puppeteer = require('puppeteer')
-const fs = require('fs').promises
+const puppeteer = require('puppeteer');
+const fs = require('fs').promises;
 const dotenv = require('dotenv')
 dotenv.config()
 
-const scrapePage = async (url) => {
+// Set para almacenar URLs ya visitadas
+const visitedUrls = new Set();
+
+async function scrapePage(url, depth = 0, maxDepth = 2) {
+  // Si ya visitamos esta URL o alcanzamos la profundidad máxima, salimos
+  if (visitedUrls.has(url) || depth > maxDepth) {
+    return null;
+  }
+
+  // Agregar URL al set de visitadas
+  visitedUrls.add(url);
+
   try {
-    // Iniciar el navegador
+    // Iniciar el navegador con opciones adicionales
     const browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    })
+      headless: "new",
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ]
+    });
 
-    console.log('Navegador iniciado')
+    // Crear nueva página con configuraciones optimizadas
+    const page = await browser.newPage();
 
-    // Crear una nueva página
-    const page = await browser.newPage()
+    // Configurar timeouts más largos
+    await page.setDefaultNavigationTimeout(120000); // 2 minutos
+    await page.setDefaultTimeout(120000);
 
-    // Configurar el TimeOut más largo para sitios lentos
-    page.setDefaultNavigationTimeout(60000)
+    // Optimizar el rendimiento
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      // Bloquear recursos innecesarios
+      if (['image', 'stylesheet', 'font', 'media'].includes(request.resourceType())) {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    });
 
-    //Ir a la URL
-    console.log(`Navegando a ${url}`)
-    await page.goto(url, {
-      waitUntil: 'networkidle0' // Esperar hasta que la red esté inactiva
-    })
+    // Intentar navegar a la página
+    console.log(`Navegando a ${url}... (profundidad: ${depth})`);
+    try {
+      await page.goto(url, {
+        waitUntil: 'networkidle2',
+        timeout: 120000
+      });
+    } catch (error) {
+      console.error(`Error al navegar a ${url}:`, error.message);
+      await browser.close();
+      return null;
+    }
 
-    // Extraer toda la información visible
+    // Extraer información
     const data = await page.evaluate(() => {
       const result = {
         title: document.title,
         url: window.location.href,
-        content: [],
-        products: []
-      }
-      // Obtener todo el texto visible
+        content: []
+      };
+
       function extractText(element) {
-        const text = element.textContent.trim()
-        if (text) result.content.push(text)
+        const text = element.textContent
+          .trim()
+          .replace(/\t/g, ' ')
+          .replace(/\s+/g, ' '); // Normalizar espacios
 
-        // Recursivamente extraer texto de elementos hijos
+        if (text && text.length > 1) { // Ignorar textos muy cortos
+          result.content.push(text);
+        }
+
         for (const child of element.children) {
-          extractText(child)
+          extractText(child);
         }
       }
 
-      extractText(document.body)
+      extractText(document.body);
 
-      // Intentar encontrar productos (ajusta los selectores según tu sitio web)
-      const productElements = document.querySelectorAll('.product, [class*="product"], [id*="product"]')
+      return result;
+    });
 
-      productElements.forEach(product => {
-        const productData = {
-          title: product.querySelector('h1, h2, h3, .title')?.textContent?.trim() || '',
-          price: product.querySelector('.price, [class*="price"]')?.textContent?.trim() || '',
-          description: product.querySelector('.description, [class*="description"]')?.textContent?.trim() || '',
-          image: product.querySelector('img')?.src || ''
+    // Obtener enlaces si no hemos alcanzado la profundidad máxima
+    if (depth < maxDepth) {
+      const links = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('a'))
+          .map(a => a.href)
+          .filter(href =>
+            href.startsWith('http') &&
+            // Asegurarse de que el enlace sea del mismo dominio
+            new URL(href).hostname === window.location.hostname
+          );
+      });
+
+      // Procesar subpáginas de forma secuencial para evitar sobrecarga
+      const uniqueLinks = [...new Set(links)];
+      data.subpages = [];
+
+      for (const link of uniqueLinks) {
+        if (!visitedUrls.has(link)) {
+          const subpageData = await scrapePage(link, depth + 1, maxDepth);
+          if (subpageData) {
+            data.subpages.push(subpageData);
+          }
         }
-
-        if (productData.title || productData.price || productData.description) {
-          result.products.push(productData)
-        }
-      })
-
-      return result
-    })
-
-    // Obtener todos los enlaces de la página
-    const links = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('a'))
-        .map(a => a.href)
-        .filter(href => href.startsWith('http'))
-    )
-
-    // Almacenar los enlaces en el objeto de datos
-    data.links = [...new Set(links)] // Eliminar duplicados
-
-    // Guardar los datos en un archivo
-    const filename = 'website_data.txt'
-    await fs.writeFile(filename, JSON.stringify(data, null, 2))
-    console.log(`Datos guardados en ${filename}`)
+      }
+    }
 
     // Cerrar el navegador
-    await browser.close()
-    console.log('Navegador cerrado')
+    await browser.close();
 
-    return data
+    // Guardar los datos en un archivo
+    const filename = `website_data_${depth}.txt`;
+    await fs.writeFile(filename, JSON.stringify(data, null, 2));
+    console.log(`Datos guardados en ${filename}`);
+
+    return data;
 
   } catch (error) {
-    console.error('Error durante el scraping:', error)
-    throw error
+    console.error(`Error durante el scraping de ${url}:`, error.message);
+    return null;
   }
 }
 
-// Función principal para ejecutar el scraper
 async function main() {
   try {
-    const url = process.env.URL_WEB_PAGE // Reemplazar con tu URL
-    const data = await scrapePage(url)
-    console.log('Scraping completado exitosamente')
+    const url = process.env.URL_WEB_PAGE; // Reemplaza con tu URL
+    console.log('Iniciando scraping...');
+    const data = await scrapePage(url);
+    console.log('Scraping completado exitosamente');
   } catch (error) {
-    console.error('Error en la ejecución principal:', error)
+    console.error('Error en la ejecución principal:', error.message);
   }
 }
 
-// Ejecutar el script
-main()
+main();
